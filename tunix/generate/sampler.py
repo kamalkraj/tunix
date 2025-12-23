@@ -644,6 +644,7 @@ class Sampler(base_sampler.BaseSampler):
       beam_size: Optional[int] = None,
       seed: int | None = None,
       pad_output: bool = False,
+      include_eos: bool = False,
   ) -> base_sampler.SamplerOutput:
     """Samples a completion of the input string.
 
@@ -673,6 +674,7 @@ class Sampler(base_sampler.BaseSampler):
         otherwise it will be max_generation_steps + max_prompt_length. The
         padding now only supports right padding. Can modify to support left
         padding if needed.
+      include_eos: whether to include the eos token in the output.
 
     Returns:
       sampler_output: A SamplerOutput object containing the generated samples.
@@ -764,6 +766,7 @@ class Sampler(base_sampler.BaseSampler):
           self.eos_ids,
           max_prompt_length,
           max_len,
+          include_eos=include_eos,
       )
       out_tokens, lengths = jax.device_get(out_tokens), jax.device_get(lengths)
       decoded_outputs = [
@@ -780,12 +783,15 @@ class Sampler(base_sampler.BaseSampler):
             if echo
             else max_prompt_length
         )
-        end_idx = (
-            utils.find_first_eos_idx(
-                token_buffer[max_prompt_length:], self.eos_ids
-            )
-            + max_prompt_length
+        eos_idx_relative = utils.find_first_eos_idx(
+            token_buffer[max_prompt_length:], self.eos_ids
         )
+        end_idx = eos_idx_relative + max_prompt_length
+        if include_eos:
+          slice_len = token_buffer.shape[0] - max_prompt_length
+          is_eos_found = eos_idx_relative < slice_len
+          end_idx = end_idx + is_eos_found.astype(jnp.int32)
+
         out_tokens.append(jax.device_get(token_buffer[start_idx:end_idx]))
         if return_logits:
           out_logits.append(logits_buffers[i][start_idx:end_idx])

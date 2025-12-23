@@ -418,6 +418,69 @@ class SamplerTest(parameterized.TestCase):
         result.tokens, [np.array([8, 14, 5]), np.array([14])]
     )
 
+  def test_include_eos(self):
+    vocab = tc.MockVocab()
+    transformer = tc.ToyTransformer(
+        config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()),
+        rngs=nnx.Rngs(42),
+    )
+    sampler = sampler_lib.Sampler(
+        transformer=transformer,
+        tokenizer=vocab,
+        cache_config=sampler_lib.CacheConfig(
+            cache_size=64,
+            num_layers=4,
+            num_kv_heads=4,
+            head_dim=16,
+        ),
+    )
+
+    # Test with include_eos=True
+    result_with_eos = sampler(
+        ['input string training', 'hello world'],
+        max_generation_steps=10,
+        max_prompt_length=4,
+        eos_tokens=[7, 21],
+        temperature=0.9,
+        top_p=1.0,
+        seed=42,
+        include_eos=True,
+    )
+
+    tokens0 = result_with_eos.tokens[0]
+    tokens1 = result_with_eos.tokens[1]
+
+    # Based on test_eos_tokens, expected tokens before EOS are [8, 14, 5] and [14]
+    self.assertEqual(len(tokens0), 4)
+    self.assertEqual(len(tokens1), 2)
+
+    self.assertIn(tokens0[-1], [7, 21])
+    self.assertIn(tokens1[-1], [7, 21])
+
+    np.testing.assert_array_equal(tokens0[:-1], [8, 14, 5])
+    np.testing.assert_array_equal(tokens1[:-1], [14])
+
+    # Test with pad_output=True and include_eos=True
+    result_padded_with_eos = sampler(
+        ['input string training', 'hello world'],
+        max_generation_steps=10,
+        max_prompt_length=4,
+        eos_tokens=[7, 21],
+        temperature=0.9,
+        top_p=1.0,
+        seed=42,
+        include_eos=True,
+        pad_output=True,
+    )
+
+    padded_tokens0 = result_padded_with_eos.tokens[0]
+    # Count non-pad tokens. pad_id is 0.
+    len0 = np.sum(padded_tokens0 != 0)
+
+    self.assertEqual(len0, 4)
+    self.assertIn(padded_tokens0[3], [7, 21])
+    np.testing.assert_array_equal(padded_tokens0[:3], [8, 14, 5])
+
 
 if __name__ == '__main__':
   absltest.main()

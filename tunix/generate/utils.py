@@ -169,6 +169,7 @@ def find_last_non_pad_idx(ids, pad_id):
         'pad_value',
         'max_prompt_length',
         'max_total_length',
+        'include_eos',
     ),
 )
 def padded_fill_tokens_and_logits(
@@ -180,6 +181,7 @@ def padded_fill_tokens_and_logits(
     eos_value: int | jax.Array,
     max_prompt_length: int,
     max_total_length: int,
+    include_eos: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
   """Truncates the token_buffers and logits_buffers to the valid output.
 
@@ -196,6 +198,7 @@ def padded_fill_tokens_and_logits(
     eos_value: The value to use for EOS.
     max_prompt_length: The maximum length of the input prompt.
     max_total_length: The maximum total length of the output.
+    include_eos: Whether to include the EOS token in the output.
 
   Returns:
     The shape of the valid output tokens, the output tokens and the output
@@ -203,7 +206,7 @@ def padded_fill_tokens_and_logits(
   """
   return jax.vmap(
       single_padded_fill_tokens_and_logits,
-      in_axes=(0, 0, None, None, None, None, None, None),
+      in_axes=(0, 0, None, None, None, None, None, None, None),
       out_axes=(0, 0, 0),
   )(
       token_buffers,
@@ -214,6 +217,7 @@ def padded_fill_tokens_and_logits(
       eos_value,
       max_prompt_length,
       max_total_length,
+      include_eos,
   )
 
 
@@ -226,6 +230,7 @@ def single_padded_fill_tokens_and_logits(
     eos_value: int | jax.Array,
     max_prompt_length: int,
     max_total_length: int,
+    include_eos: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
   """Generates tokens and logits from the input token_buffer and logits_buffer."""
   start_idx = (
@@ -233,10 +238,15 @@ def single_padded_fill_tokens_and_logits(
       if echo
       else max_prompt_length
   )
-  end_idx = (
-      find_first_eos_idx(token_buffer[max_prompt_length:], eos_value)
-      + max_prompt_length
+  eos_idx_relative = find_first_eos_idx(
+      token_buffer[max_prompt_length:], eos_value
   )
+  end_idx = eos_idx_relative + max_prompt_length
+  if include_eos:
+    slice_len = token_buffer.shape[0] - max_prompt_length
+    is_eos_found = eos_idx_relative < slice_len
+    end_idx = end_idx + is_eos_found.astype(jnp.int32)
+
   length = end_idx - start_idx
   mask = jnp.arange(max_total_length) < length
   padded_token_buffer = jnp.pad(
@@ -720,6 +730,7 @@ def transfer_state_directly(
     dst_state: The destination state to transfer to.
     reshard_fn: A function to shard the values.
   """
+
   def safe_has_key(obj: Mapping[str, Any], key: str) -> bool:
     if isinstance(obj, dict):
       return key in obj
@@ -727,12 +738,16 @@ def transfer_state_directly(
     return hasattr(obj, key)
 
   # Unwrap Source (Remove 'base' wrapper from MaxText)
-  if isinstance(src_state, (dict, nnx.State, nnx.Dict)) and safe_has_key(src_state, 'base'):
+  if isinstance(src_state, (dict, nnx.State, nnx.Dict)) and safe_has_key(
+      src_state, 'base'
+  ):
     logging.info("Unwrapping 'base' key from source state.")
     src_state = src_state['base']
 
   # Unwrap Target (Remove nested 'model' wrappers from vLLM)
-  while isinstance(dst_state, (dict, nnx.State, nnx.Dict)) and safe_has_key(dst_state, 'model'):
+  while isinstance(dst_state, (dict, nnx.State, nnx.Dict)) and safe_has_key(
+      dst_state, 'model'
+  ):
     logging.info("Unwrapping nested 'model' key from target state.")
     dst_state = dst_state['model']
 
@@ -758,7 +773,9 @@ def transfer_state_directly(
     return node
 
   # Helper: Intersect Trees (Handle KVCache/RNG mismatches)
-  def intersect_trees(src: Any, tgt_spec: Any, path: str = "") -> Tuple[Any, Any]:
+  def intersect_trees(
+      src: Any, tgt_spec: Any, path: str = ''
+  ) -> Tuple[Any, Any]:
     # Stop recursion if we hit a leaf (non-dict)
     if not isinstance(src, dict) or not isinstance(tgt_spec, dict):
       return src, tgt_spec
@@ -781,7 +798,7 @@ def transfer_state_directly(
     filtered_tgt = {}
 
     for k in common_keys:
-      new_path = f"{path}/{k}" if path else k
+      new_path = f'{path}/{k}' if path else k
       s_val, t_val = intersect_trees(src[k], tgt_spec[k], new_path)
       filtered_src[k] = s_val
       filtered_tgt[k] = t_val
