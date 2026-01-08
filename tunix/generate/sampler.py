@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import dataclasses
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 import warnings
 
 from absl import logging
@@ -803,3 +803,181 @@ class Sampler(base_sampler.BaseSampler):
         logprobs=None,
     )
     return result
+
+  def stream(
+      self,
+      input_strings: str | Sequence[str],
+      max_generation_steps: int,
+      max_prompt_length: int | None = None,
+      temperature: float = 0.0,
+      top_p: Optional[float] = None,
+      top_k: Optional[int] = None,
+      seed: int | None = None,
+      eos_tokens: Sequence[int] | None = None,
+      forbidden_tokens: Sequence[str] | None = None,
+      return_logits: bool = False,
+  ) -> Iterator[base_sampler.StreamingSamplerOutput]:
+    """Streams generated tokens one at a time.
+
+    This method yields StreamingSamplerOutput objects as tokens are generated,
+    allowing for real-time streaming of model outputs. Unlike __call__, this
+    uses a Python loop instead of jax.lax.while_loop to enable yielding
+    intermediate results.
+
+    Note: Streaming currently only supports batch size of 1 and does not
+    support beam search.
+
+    Args:
+      input_strings: input prompt to feed to the model for sampling.
+      max_generation_steps: maximum number of generation steps.
+      max_prompt_length: maximum length of the prompt.
+      temperature: temperature for sampling.
+      top_p: top-p sampling threshold.
+      top_k: top-k sampling threshold.
+      seed: random seed for sampling.
+      eos_tokens: end of sequence tokens to stop generation.
+      forbidden_tokens: list of tokens that are forbidden to be generated.
+      return_logits: whether to return per-step logits.
+
+    Yields:
+      StreamingSamplerOutput: Output for each generated token.
+
+    Raises:
+      ValueError: If batch size > 1 or beam search is requested.
+    """
+    self.eos_ids = jnp.array(eos_tokens or [self.tokenizer.eos_id()])
+    input_strings = (
+        [input_strings] if isinstance(input_strings, str) else input_strings
+    )
+
+    if len(input_strings) != 1:
+      raise ValueError(
+          "Streaming only supports batch size of 1. "
+          f"Received {len(input_strings)} input strings."
+      )
+
+    forbidden_token_ids = None
+    if forbidden_tokens is not None:
+      forbidden_token_ids = []
+      for token in forbidden_tokens:
+        token_id = self.tokenizer.encode(token)
+        if len(token_id) != 1:
+          raise ValueError(
+              "Forbidden tokens must map to single token ids in the vocab."
+          )
+        forbidden_token_ids.extend(token_id)
+      forbidden_token_ids = tuple(forbidden_token_ids)
+
+    tokens = [self.tokenize(x) for x in input_strings]
+    max_tokens_length = max(len(x) for x in tokens)
+    if max_prompt_length is None or max_prompt_length < max_tokens_length:
+      max_prompt_length = utils.next_power_of_2(max_tokens_length)
+
+    all_input_ids = np.array([
+        utils.pad_to_length(
+            x,
+            target_length=max_prompt_length,
+            pad_value=self.tokenizer.pad_id(),
+            left=True,
+        )
+        for x in tokens
+    ])
+
+    total_sampling_steps = max_prompt_length + max_generation_steps
+    if total_sampling_steps > self.cache_config.cache_size:
+      raise ValueError(
+          f"Total sampling steps {total_sampling_steps} must be less than the"
+          f" cache size {self.cache_config.cache_size}."
+      )
+
+    if seed is None:
+      seed = jax.random.PRNGKey(0)
+    elif isinstance(seed, int):
+      seed = jax.random.PRNGKey(seed)
+
+    sampling_state = self.init_sample_state(
+        jnp.array(all_input_ids),
+        include_logits=return_logits,
+        total_sampling_steps=total_sampling_steps,
+        forbidden_token_ids=forbidden_token_ids,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        seed=seed,
+        beam_size=None,
+    )
+
+    # Run prefill
+    sampling_state = self._compiled_prefill_fn(
+        self._flattened_transformer_state, sampling_state
+    )
+
+    # Yield the first token from prefill
+    first_token = int(
+        jax.device_get(
+            sampling_state.token_buffer[0, sampling_state.decoding_step]
+        )
+    )
+    first_token_text = self.tokenizer.decode([first_token])
+    first_done = bool(jnp.isin(first_token, self.eos_ids))
+
+    first_logits = None
+    if return_logits and sampling_state.logits_buffer is not None:
+      first_logits = sampling_state.logits_buffer[
+          0, sampling_state.decoding_step
+      ]
+
+    yield base_sampler.StreamingSamplerOutput(
+        text=first_token_text,
+        token=first_token,
+        done=first_done,
+        step=0,
+        logits=first_logits,
+    )
+
+    if first_done:
+      return
+
+    # Compile single step function for streaming
+    compiled_sample_step = jax.jit(self._sample_step)
+
+    # Stream remaining tokens using Python loop
+    # Note: We limit iterations to max_generation_steps - 1 because prefill
+    # already generated the first token.
+    step = 1
+    while (
+        step < max_generation_steps
+        and sampling_state.decoding_step < sampling_state.total_sampling_steps - 1
+        and not jnp.all(sampling_state.done)
+    ):
+      sampling_state = compiled_sample_step(
+          self._flattened_transformer_state, sampling_state
+      )
+
+      # Get the newly generated token
+      new_token = int(
+          jax.device_get(
+              sampling_state.token_buffer[0, sampling_state.decoding_step]
+          )
+      )
+      new_token_text = self.tokenizer.decode([new_token])
+      is_done = bool(sampling_state.done[0])
+
+      step_logits = None
+      if return_logits and sampling_state.logits_buffer is not None:
+        step_logits = sampling_state.logits_buffer[
+            0, sampling_state.decoding_step
+        ]
+
+      yield base_sampler.StreamingSamplerOutput(
+          text=new_token_text,
+          token=new_token,
+          done=is_done,
+          step=step,
+          logits=step_logits,
+      )
+
+      if is_done:
+        return
+
+      step += 1

@@ -418,6 +418,166 @@ class SamplerTest(parameterized.TestCase):
         result.tokens, [np.array([8, 14, 5]), np.array([14])]
     )
 
+  def test_stream_basic(self):
+    """Test basic streaming functionality."""
+    vocab = tc.MockVocab()
+    transformer = tc.ToyTransformer(
+        config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()),
+        rngs=nnx.Rngs(42),
+    )
+    sampler = sampler_lib.Sampler(
+        transformer=transformer,
+        tokenizer=vocab,
+        cache_config=sampler_lib.CacheConfig(
+            cache_size=64,
+            num_layers=4,
+            num_kv_heads=4,
+            head_dim=16,
+        ),
+    )
+
+    streamed_tokens = []
+    streamed_texts = []
+    for output in sampler.stream(
+        'input string',
+        max_generation_steps=5,
+    ):
+      self.assertIsInstance(output.token, int)
+      self.assertIsInstance(output.text, str)
+      self.assertIsInstance(output.done, bool)
+      self.assertIsInstance(output.step, int)
+      streamed_tokens.append(output.token)
+      streamed_texts.append(output.text)
+      if output.done:
+        break
+
+    self.assertGreater(len(streamed_tokens), 0)
+    self.assertLessEqual(len(streamed_tokens), 5)
+
+  def test_stream_matches_call(self):
+    """Test that streaming produces same tokens as non-streaming."""
+    vocab = tc.MockVocab()
+    transformer = tc.ToyTransformer(
+        config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()),
+        rngs=nnx.Rngs(42),
+    )
+    sampler = sampler_lib.Sampler(
+        transformer=transformer,
+        tokenizer=vocab,
+        cache_config=sampler_lib.CacheConfig(
+            cache_size=64,
+            num_layers=4,
+            num_kv_heads=4,
+            head_dim=16,
+        ),
+    )
+
+    # Get non-streaming result
+    non_stream_result = sampler(
+        ['input string'],
+        max_generation_steps=5,
+    )
+
+    # Get streaming result
+    streamed_tokens = []
+    for output in sampler.stream(
+        'input string',
+        max_generation_steps=5,
+    ):
+      streamed_tokens.append(output.token)
+      if output.done:
+        break
+
+    # Compare tokens (streaming yields individual tokens, non-streaming returns array)
+    np.testing.assert_array_equal(
+        streamed_tokens, non_stream_result.tokens[0].tolist()
+    )
+
+  def test_stream_with_logits(self):
+    """Test streaming with return_logits=True."""
+    vocab = tc.MockVocab()
+    transformer = tc.ToyTransformer(
+        config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()),
+        rngs=nnx.Rngs(42),
+    )
+    sampler = sampler_lib.Sampler(
+        transformer=transformer,
+        tokenizer=vocab,
+        cache_config=sampler_lib.CacheConfig(
+            cache_size=64,
+            num_layers=4,
+            num_kv_heads=4,
+            head_dim=16,
+        ),
+    )
+
+    for output in sampler.stream(
+        'input string',
+        max_generation_steps=3,
+        return_logits=True,
+    ):
+      self.assertIsNotNone(output.logits)
+      self.assertEqual(output.logits.shape, (vocab.GetPieceSize(),))
+      if output.done:
+        break
+
+  def test_stream_batch_size_error(self):
+    """Test that streaming raises error for batch size > 1."""
+    vocab = tc.MockVocab()
+    transformer = tc.ToyTransformer(
+        config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()),
+        rngs=nnx.Rngs(42),
+    )
+    sampler = sampler_lib.Sampler(
+        transformer=transformer,
+        tokenizer=vocab,
+        cache_config=sampler_lib.CacheConfig(
+            cache_size=64,
+            num_layers=4,
+            num_kv_heads=4,
+            head_dim=16,
+        ),
+    )
+
+    with self.assertRaisesRegex(ValueError, 'Streaming only supports batch size of 1'):
+      # Need to iterate to trigger the generator
+      list(sampler.stream(
+          ['input string', 'hello world'],
+          max_generation_steps=5,
+      ))
+
+  def test_stream_with_top_p(self):
+    """Test streaming with top_p sampling."""
+    vocab = tc.MockVocab()
+    transformer = tc.ToyTransformer(
+        config=tc.ModelConfig(vocab_size=vocab.GetPieceSize()),
+        rngs=nnx.Rngs(42),
+    )
+    sampler = sampler_lib.Sampler(
+        transformer=transformer,
+        tokenizer=vocab,
+        cache_config=sampler_lib.CacheConfig(
+            cache_size=64,
+            num_layers=4,
+            num_kv_heads=4,
+            head_dim=16,
+        ),
+    )
+
+    streamed_tokens = []
+    for output in sampler.stream(
+        'input string',
+        max_generation_steps=5,
+        temperature=0.9,
+        top_p=0.95,
+        seed=42,
+    ):
+      streamed_tokens.append(output.token)
+      if output.done:
+        break
+
+    self.assertGreater(len(streamed_tokens), 0)
+
 
 if __name__ == '__main__':
   absltest.main()

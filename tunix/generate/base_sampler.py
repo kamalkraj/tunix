@@ -15,7 +15,7 @@
 """Base class for samplers."""
 import abc
 import dataclasses
-from typing import List, Optional
+from typing import Iterator, List, Optional
 
 from flax import nnx
 from flax.nnx import statelib
@@ -45,6 +45,26 @@ class SamplerOutput:
   padded_prompt_tokens: np.ndarray
 
   logprobs: Optional[list[float]]
+
+
+@dataclasses.dataclass
+class StreamingSamplerOutput:
+  """Output of a single streaming step from the sampler."""
+
+  # Decoded text for the new token(s) generated in this step.
+  text: str
+
+  # The new token(s) generated in this step.
+  token: int
+
+  # Whether generation is complete (hit EOS or max steps).
+  done: bool
+
+  # Current step index in the generation.
+  step: int
+
+  # Logits for this step (if requested).
+  logits: Optional[jax.Array] = None
 
 
 class BaseSampler(ABC):
@@ -81,3 +101,41 @@ class BaseSampler(ABC):
   @abstractmethod
   def tokenize(self, input_string: str) -> np.ndarray | list[int]:
     """Returns the tokenized the input string."""
+
+  def stream(
+      self,
+      input_strings: List[str],
+      max_generation_steps: int,
+      max_prompt_length: int | None = None,
+      temperature: float = 0.0,
+      top_p: float | None = None,
+      top_k: int | None = None,
+      seed: int | None = None,
+      eos_tokens: list[int] | None = None,
+      forbidden_tokens: list[str] | None = None,
+      return_logits: bool = False,
+  ) -> Iterator[StreamingSamplerOutput]:
+    """Streams generated tokens one at a time.
+
+    This method yields StreamingSamplerOutput objects as tokens are generated,
+    allowing for real-time streaming of model outputs.
+
+    Args:
+      input_strings: input prompts to feed to the model for sampling.
+      max_generation_steps: maximum number of generation steps.
+      max_prompt_length: maximum length of the prompt.
+      temperature: temperature for sampling.
+      top_p: top-p sampling threshold.
+      top_k: top-k sampling threshold.
+      seed: random seed for sampling.
+      eos_tokens: end of sequence tokens to stop generation.
+      forbidden_tokens: list of tokens that are forbidden to be generated.
+      return_logits: whether to return per-step logits.
+
+    Yields:
+      StreamingSamplerOutput: Output for each generated token.
+
+    Raises:
+      NotImplementedError: If streaming is not supported by this sampler.
+    """
+    raise NotImplementedError("Streaming is not supported by this sampler.")
